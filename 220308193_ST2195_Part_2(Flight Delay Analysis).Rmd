@@ -1,0 +1,560 @@
+---
+title: "Flight Delay"
+author: "220308193"
+date: "2026-03-27"
+output: "html_document"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We start by setting up data folder path.
+Set the DATA_FOLDER path to the respected folder containing the dataverse files downloaded for Part2.
+After setting the DATA_FOLDER path to your respected containing the dataverse files , you can click on 'Run all' to see the output.
+
+```{r data_folder}
+DATA_FOLDER <- "C:/ST2195 coursework/dataverse_files"
+```
+
+This is the full path where the SQLite database will be created.
+The database stores all flight data loaded from the respected year CSV files
+It only needs to be built once any subsequent knits reuses it.
+
+```{r db_path}
+DB_PATH <- "flights.db"
+```
+
+We check working directory and folder path and check if all the required files for the coursework are present by printing the files.
+
+```{r directory}
+getwd()
+print(list.files(DATA_FOLDER))
+```
+
+Install and load libraries needed.
+
+```{r libraries}
+
+install.packages("DBI")
+install.packages("RSQLite")
+install.packages("dplyr")
+install.packages("ggplot2")
+install.packages("ggcorrplot")
+install.packages("caret")
+install.packages("pROC")
+install.packages("tidyr")
+install.packages("data.table")
+```
+
+```{r load libraries}
+
+library(DBI)
+library(RSQLite)
+library(dplyr)
+library(ggplot2)
+library(ggcorrplot)
+library(caret)
+library(pROC)
+library(tidyr)
+library(data.table)
+```
+
+Keeping reproducibility of code in mind , we create a database inside flights.db which would contain all flight year data from 2000 to 2004 using DBI and RSQLITE package 
+This would save RAM by not loading everything into it.
+
+```{r creating connection to sqlite database}
+
+conn <- dbConnect(SQLite(), DB_PATH)  # creates connection
+
+if (!dbExistsTable(conn, "flights")) {
+  
+  for (year in 2000:2004) {
+    
+    file_path <- paste0(DATA_FOLDER, "/", year, ".csv.bz2")
+    cat("Loading:", year, "\n")
+    
+    df <- fread(file_path)
+    
+    names(df) <- tolower(names(df))  # convert column names to lowercase
+    
+    if (year == 2000) {
+      dbWriteTable(conn, "flights", df, overwrite = TRUE)
+    } else {
+      dbWriteTable(conn, "flights", df, append = TRUE)
+    }
+    
+    rm(df); gc()
+  }
+}
+```
+After creating a database connecting and loading years(2000-2004) which will be used for this analysis we do some quick analysis of the values in flights database
+
+```{r  flights values analysis }
+#structure of the database
+dbGetQuery(conn, "PRAGMA table_info(flights);")
+
+#total rows
+dbGetQuery(conn, "SELECT COUNT(*) FROM flights;") 
+
+#Summary for arrival delay variable
+dbGetQuery(conn, "
+  SELECT 
+    MIN(arrdelay),
+    MAX(arrdelay),
+    AVG(arrdelay)
+  FROM flights
+  WHERE cancelled = 0 AND diverted = 0
+")
+```
+arrdelay has extreme values min = -1300 minutes and maximum 2137 minutes,these seems data entry errors.
+So we cap arrdelay at -120 minute(2 hours) and 300 minutes(5 hours) since arrival of 2 hours earlier and delay of 5 hours is certainly not plausible.
+Along with arrdelay other variables with impossible values like negative elapsed time and deptime and arrtime greater than 2359 will also be removed from the database.
+This is done to ensure our analysis does not produce biased or untrue results. 
+
+NOTE - We do not remove diverted flights and cancelled flights since we would need those to answer questions 2C.
+
+```{r cleaning}
+dbExecute(conn, "DELETE FROM flights WHERE actualelapsedtime < 0")
+dbExecute(conn, "DELETE FROM flights WHERE crselapsedtime < 0")
+dbExecute(conn, "DELETE FROM flights WHERE deptime > 2359")
+dbExecute(conn, "DELETE FROM flights WHERE arrtime > 2359")
+dbExecute(conn, "DELETE FROM flights WHERE arrdelay < -120 OR arrdelay > 300")
+```
+
+
+#Question 2A - What are the best times and days of the week to minimize delays each year?
+
+Firstly,to answer best days of the week that minimize the flight delay we create a data frame best_day. Using the CASE statement we convert numeric dayofweek variable into weekday names(Monday-Sunday).Based on the definition by the Federal Aviation Administration (FAA), a flight is considered on time if its arrival delay is less than 15 minutes. So the on-time metric is measured by calculating the proportion of flights with arrdelay < 15 relative to the total number of flights and is expressed as a percentage.
+Further data is cleaned using WHERE clause to remove cancelled and diverted flights and observation with Null values for arrtime and dayofweek.
+
+
+```{r best day of week per year}
+
+# Best day of week per year
+best_day <- dbGetQuery(conn, "
+  SELECT year,
+    CASE dayofweek
+      WHEN 1 THEN 'Monday'
+      WHEN 2 THEN 'Tuesday'
+      WHEN 3 THEN 'Wednesday'
+      WHEN 4 THEN 'Thursday'
+      WHEN 5 THEN 'Friday'
+      WHEN 6 THEN 'Saturday'
+      WHEN 7 THEN 'Sunday'
+    END AS day_of_week,
+    ROUND(100.0 * SUM(CASE WHEN arrdelay < 15 THEN 1 ELSE 0 END) / COUNT(*), 2) AS ontime_rate
+  FROM flights
+  WHERE cancelled = 0
+    AND diverted  = 0
+    AND arrdelay  IS NOT NULL
+    AND dayofweek IS NOT NULL
+  GROUP BY year, dayofweek
+")
+
+best_day <- best_day %>%
+  group_by(year) %>%
+  slice_max(ontime_rate, n = 1) %>%
+  ungroup()
+
+cat("Best day of week per year (highest on-time rate):\n")
+for (i in 1:nrow(best_day)) {
+  cat(" ", best_day$year[i], ":", best_day$day_of_week[i],
+      "(on-time rate:", paste0(best_day$ontime_rate[i], "%)\n"))
+}
+``` 
+
+In a similar way as before, to determine the best time of day that minimises flight delays, we build a data frame as best_time. A CASE statement is used to group departure times into four time periods based on the HHMM format:
+
+Midnight: 0000 to 0559
+Morning: 0600 to 1159
+Afternoon: 1200 to 1759
+Night: 1800 to 2359 
+
+ontime rate and further cleaning process is done in the same way as before. 
+
+```{r best time of the day per year}
+best_time <- dbGetQuery(conn, "
+  SELECT year,
+    CASE 
+      WHEN deptime <= 559  THEN 'Midnight'
+      WHEN deptime <= 1159 THEN 'Morning'
+      WHEN deptime <= 1759 THEN 'Afternoon'
+      ELSE 'Night'
+    END AS time_of_day,
+    ROUND(100.0 * SUM(CASE WHEN arrdelay < 15 THEN 1 ELSE 0 END) / COUNT(*), 2) AS ontime_rate
+  FROM flights
+  WHERE cancelled = 0
+    AND diverted  = 0
+    AND arrdelay  IS NOT NULL
+    AND deptime   IS NOT NULL
+  GROUP BY year, time_of_day
+")
+
+best_time <- best_time %>%
+  group_by(year) %>%
+  slice_max(ontime_rate, n = 1) %>%
+  ungroup()
+
+cat("Best time of day per year (highest on-time rate):\n")
+for (i in 1:nrow(best_time)) {
+  cat(" ", best_time$year[i], ":", best_time$time_of_day[i],
+      "(on-time rate:", paste0(best_time$ontime_rate[i], "%)\n"))
+}
+```
+To analyse how flight delays vary across both the day of the week and time of day we create a heatmap plot.
+First we start with creating a dataframe as heatmap_df , again two of the CASE statements is used likewise.
+The average arrival delay (avg_delay) is then calculated for each combination of year, day of the week, and time of day using the AVG() function.
+
+Then the day of week and time of day variables are converted into ordered factors to ensure a logical and consistent display in the heatmap plot which is generated using ggplot2, where the x-axis represents time of day, the y-axis represents day of the week, and the fill colour indicates the average delay. A diverging colour scale is used, with blue representing lower (negative) delays, red representing higher delays, and white centred at zero delay.
+
+```{r heatmap}
+
+heatmap_df <- dbGetQuery(conn, "
+  SELECT year,
+         CASE dayofweek
+           WHEN 1 THEN 'Monday'
+           WHEN 2 THEN 'Tuesday'
+           WHEN 3 THEN 'Wednesday'
+           WHEN 4 THEN 'Thursday'
+           WHEN 5 THEN 'Friday'
+           WHEN 6 THEN 'Saturday'
+           WHEN 7 THEN 'Sunday'
+         END AS dayofweekstring,
+
+         CASE 
+           WHEN deptime <= 559 THEN 'Midnight'
+           WHEN deptime <= 1159 THEN 'Morning'
+           WHEN deptime <= 1759 THEN 'Afternoon'
+           ELSE 'Night'
+         END AS time_of_day,
+
+         AVG(arrdelay) AS avg_delay
+
+  FROM flights
+  WHERE cancelled = 0
+    AND diverted  = 0
+    AND arrdelay IS NOT NULL
+    AND deptime IS NOT NULL
+
+  GROUP BY year, dayofweekstring, time_of_day
+")
+
+heatmap_df$dayofweekstring <- factor(heatmap_df$dayofweekstring,
+  levels = c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"))
+
+heatmap_df$time_of_day <- factor(heatmap_df$time_of_day,
+  levels = c("Midnight","Morning","Afternoon","Night"))
+
+ggplot(heatmap_df, aes(x = time_of_day, y = dayofweekstring, fill = avg_delay)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(avg_delay, 1)), size = 3) +
+  scale_fill_gradient2(
+    low      = "steelblue",
+    mid      = "white",
+    high     = "darkred",
+    midpoint = 0,
+    name     = "Avg Delay\n(minutes)"
+  ) +
+  facet_wrap(~ year, nrow = 1) +
+  labs(
+    title = "Average Arrival Delay by Day of Week and Time of Day (2000-2004)",
+    x     = "Time of Day",
+    y     = "Day of Week"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 30, hjust = 1),
+    strip.text      = element_text(face = "bold", size = 12),
+    plot.title      = element_text(face = "bold", size = 13),
+    legend.position = "right"
+  )
+```
+
+#Question 2b - Evaluate whether older planes suffer more delays on a year-to-year basis.
+
+Loading plane-data.csv and storing it in a dataframe as planes_df.
+Saving the dataframe into a sqlite database. 
+
+```{r load}
+planes_df <- read.csv(paste0(DATA_FOLDER, "/plane-data.csv"), encoding = "latin1")
+dbWriteTable(conn, "planes", planes_df, overwrite = TRUE, row.names = FALSE)
+```
+
+We analyze data type of variables in plane data 
+
+```{r analyze data type}
+str(planes_df)
+```
+tailnum variable will be used to link the flights and planes datasets to analyse whether older aircraft experience more delays so it becomes important to ensure that the values of standarised to avoid errors while merging 
+
+We check if there are any lowercase letters in Tailnum variable.
+Likewise we check for invalid values in the year variable.
+```{r valid values}
+dbGetQuery(conn, "
+  SELECT COUNT(*) 
+  FROM flights
+  WHERE tailnum != UPPER(tailnum)
+ ")
+
+dbGetQuery(conn, "
+  SELECT 
+    SUM(year = '0000'),
+    SUM(year IS NULL),
+    SUM(TRIM(year) = ''),
+    SUM(year = 'None'),
+    SUM(CAST(year AS INTEGER) < 1900)
+  FROM planes
+")
+```
+Firstly a new table flights_clean is created from the flights Database, here tailnum_clean, is generated by converting all values to lowercase using the LOWER() function to ensure all standardization. Rows with missing or empty tailnum values are excluded so that only valid identifiers are retained.
+
+A second new table planes_clean is created from the original planes csv. Again the tailnum variable is standardized to lowercase to ensure consistency with the flights data. In addition, the year variable—representing the aircraft manufacturing year—is converted to an integer using CAST(), and invalid entries are removed.
+
+```{r standardize and clean}
+
+if (!dbExistsTable(conn, "flights_clean")) {
+  dbExecute(conn, "
+    CREATE TABLE flights_clean AS
+    SELECT *, LOWER(tailnum) AS tailnum_clean
+    FROM flights
+    WHERE tailnum IS NOT NULL AND tailnum != ''
+  ")
+}
+
+if (!dbExistsTable(conn, "planes_clean")) {
+  dbExecute(conn, "
+    CREATE TABLE planes_clean AS
+    SELECT 
+      LOWER(tailnum) AS tailnum_clean,
+      CAST(year AS INTEGER) AS year
+    FROM planes
+    WHERE tailnum IS NOT NULL 
+      AND tailnum != ''
+      AND TRIM(year) != ''
+      AND TRIM(year) != '0000'
+      AND CAST(year AS INTEGER) > 1900
+  ")
+}
+```
+To analyse the relationship between aircraft age and flight delays, a combined dataset age_df is created by joining the cleaned flights and planes tables using a common identifier (tailnum_clean). 
+Again CAST clause is used to convert year into integers and arrdelay into real inorder to maintain standardization across, and WHERE clause is used to remove invalid data as done previously.
+
+```{r merging plane and flights data}
+
+age_df <- dbGetQuery(conn, "
+  SELECT 
+    CAST(f.year AS INTEGER)  AS flight_year,
+    f.tailnum_clean          AS tailnum,
+    CAST(f.arrdelay AS REAL) AS arrdelay,
+    CAST(p.year AS INTEGER)  AS plane_year
+  FROM flights_clean f
+  INNER JOIN planes_clean p
+    ON f.tailnum_clean = p.tailnum_clean
+  WHERE f.cancelled = 0
+    AND f.diverted  = 0
+    AND f.arrdelay IS NOT NULL
+    AND p.year IS NOT NULL
+")
+```
+
+Subtracting year of the flight from year when plane was manufactured that is plane_year inorder to get the age of the plane at the time of the flight.
+
+```{r age_df}
+age_df$plane_age <- age_df$flight_year - age_df$plane_year
+head(age_df)
+```
+
+
+In order to create a line plot, we first construct a summary dataset plane_age_summary from the merged dataset age_df. The data is grouped by plane_age, and for each age group, the average arrival delay is calculated using the mean of arrdelay. In addition, the number of flights (flight_count) for each age is computed to exclude age groups with fewer than 100 observations and this done to ensure that the results are not driven by small sample sizes.
+
+Using this plane_age_summary dataset, a line plot is generated with plane age on the x-axis and average arrival delay on the y-axis. The line represents how delays vary across different aircraft ages. Furthermore, a linear trend line is added to highlight the overall direction of the relationship between plane age and delays.
+
+This visualisation allows us to assess whether older aircraft tend to experience higher or lower delays compared to newer ones.
+
+
+```{r line plot}
+
+plane_age_summary <- age_df %>%
+  group_by(plane_age) %>%
+  summarise(avg_delay = mean(arrdelay, na.rm = TRUE),
+            flight_count = n()) %>%
+  filter(flight_count > 100) %>%
+  ungroup()
+
+ggplot(plane_age_summary, aes(x = plane_age, y = avg_delay)) +
+  geom_line(colour = "steelblue") +
+  geom_smooth(method = "lm", colour = "red", se = FALSE) +
+  labs(title = "Average Arrival Delay by Plane Age (2000-2004)",
+       x     = "Plane Age (years)",
+       y     = "Average Arrival Delay (minutes)") +
+  theme_minimal()
+```
+Similarly we compute spearman correlation coefficient for each year to complement the line plot.
+using age_df and grouping it with flight_year for each year, the Spearman correlation between plane_age and arrdelay is calculated.
+
+```{r spearman correlation}
+spearman_results <- age_df %>%
+  group_by(flight_year) %>%
+  summarise(
+    spearman_cor = cor(plane_age, arrdelay, method = "spearman", use = "complete.obs"),
+  ) %>%
+  ungroup()
+
+print(spearman_results)
+```
+#Question 2c -For each year, fit a logistic regression model for the probability of diverted US flights using as manyfeatures as possible from attributes of the departure date, the scheduled departure and arrival times, the coordinates and distance between departure and planned arrival airports, and the carrier. Visualize the coefficients across years.
+
+First we load the aiports.csv and write it into sql database.
+Using the flights and airport_df a new table is constructed as flights_diverted, only variables that are available before the flight departs are included.
+
+We do not include departure delay , taxi-out time and etc because those values are only known after the flight has already left.
+
+Finally the flights table is joined with the airports dataset twice using LEFT JOIN to include origin and destination along with their latitude and longitude in the flights_diverted table and rows with invalid values some variables are removed.
+
+The main reason behind creating flights_diverted is that later to get the coefficients we would have to iterate five time - once per year using loops. If we didn't have this table, each iteration would have to join the full flights table with the airports table twice just to get the coordinates. Doing that join once upfront and saving the result is a lot faster than repeating it five times inside the loop.
+ 
+```{r flights_diverted}
+airports_df <- read.csv(paste0(DATA_FOLDER, "/airports.csv"))
+dbWriteTable(conn, "airports", airports_df, overwrite = TRUE, row.names = FALSE)
+
+if (!dbExistsTable(conn, "flights_diverted")) {
+  dbExecute(conn, "
+    CREATE TABLE flights_diverted AS
+    SELECT 
+      f.year, f.month, f.dayofweek,
+      f.uniquecarrier,
+      f.crsdeptime, f.crsarrtime, f.crselapsedtime,
+      f.distance, f.diverted,
+      a1.lat  AS origin_lat, a1.long AS origin_lon,
+      a2.lat  AS dest_lat,   a2.long AS dest_lon
+    FROM flights f
+    LEFT JOIN airports a1 ON f.origin = a1.iata
+    LEFT JOIN airports a2 ON f.dest   = a2.iata
+    WHERE f.cancelled = 0
+      AND f.diverted  IS NOT NULL
+      AND f.distance  IS NOT NULL
+      AND f.crselapsedtime IS NOT NULL
+  ")
+}
+```
+Now we move on to fitting the logistic regression model for each year. In this step we loop through 2000 to 2004, pulling one year at a time from flights_diverted. For each year the numeric features are standardised so their coefficients are on the same scale, categorical variables are converted to factors for the feature encoding and the data is split 70/30 into training and test sets. Also The model is then fit on the training data and the coefficients are extracted and stored. Memory is cleared after each year before moving to the next one. At the end all five years of coefficients are combined into a single data frame all_coef_df
+```{r}
+years     <- 2000:2004
+coef_list <- list()
+
+for (yr in years) {
+  cat("Fitting year:", yr, "\n")
+  
+  yr_df <- dbGetQuery(conn, paste0("
+    SELECT 
+      diverted, month, dayofweek, uniquecarrier,
+      crsdeptime, crsarrtime, crselapsedtime,
+      distance, origin_lat, origin_lon, dest_lat, dest_lon
+    FROM flights_diverted
+    WHERE year = ", yr, "
+  "))
+  
+  colnames(yr_df) <- tolower(colnames(yr_df))
+  yr_df <- yr_df[complete.cases(yr_df), ]
+  
+  # ── 1. Standardize numeric features
+  
+  num_features <- c("crsdeptime", "crsarrtime", "crselapsedtime",
+                    "distance", "origin_lat", "origin_lon",
+                    "dest_lat", "dest_lon")
+  yr_df[, num_features] <- scale(yr_df[, num_features])
+  
+  # ── 2. Feature/Dummy encoding 
+  yr_df$diverted      <- as.factor(yr_df$diverted)
+  yr_df$uniquecarrier <- as.factor(yr_df$uniquecarrier)
+  yr_df$month         <- as.factor(yr_df$month)
+  yr_df$dayofweek     <- as.factor(yr_df$dayofweek)
+  
+  
+  # ── 3. Stratified 70/30 train-test split
+  train_index <- createDataPartition(yr_df$diverted, p = 0.7, list = FALSE)
+  train_data  <- yr_df[ train_index, ]
+  test_data   <- yr_df[-train_index, ]
+  
+  
+  # Fit model
+  model <- glm(
+  diverted ~ month + dayofweek + uniquecarrier +
+             crsdeptime +
+             distance +
+             origin_lat + origin_lon +
+             dest_lat + dest_lon,
+  data   = train_data,
+  family = binomial(link = "logit")
+)
+  
+  # Extract coefficients
+  coefs           <- as.data.frame(summary(model)$coefficients)
+  coefs$year      <- yr
+  coefs$predictor <- rownames(coefs)
+  rownames(coefs) <- NULL
+  coef_list[[as.character(yr)]] <- coefs
+  
+  rm(yr_df, train_data, test_data, model); gc()
+}
+
+all_coef_df <- do.call(rbind, coef_list)
+colnames(all_coef_df) <- c("estimate", "std_error", "z_value", "p_value", "year", "predictor")
+```
+Inorder to present the results from the logistic regression models of the six variables are included in num_predictors.
+Then they are iterated over each year from 2000 to 2004,for each year, the intercept of the logistic regression model is printed, representing the baseline log-odds of a flight being diverted when all predictors are at their reference levels.
+
+The coefficients corresponding to the selected numerical predictors are then extracted from the combined coefficients dataset (all_coef_df) by filtering based on both the year and the predictor names. These coefficients are printed sequentially for each predictor.
+
+
+```{r regression coefficients}
+
+num_predictors <- c("crsdeptime", "distance",
+                    "origin_lat", "origin_lon",
+                    "dest_lat", "dest_lon")
+
+for (yr in 2000:2004) {
+  cat("Logistic Regression Model for Year", yr, ":\n")
+  
+  cat("Intercept:", 
+      all_coef_df$estimate[all_coef_df$year == yr & 
+                           all_coef_df$predictor == "(Intercept)"], "\n")
+  
+  yr_coefs <- all_coef_df[all_coef_df$year == yr & 
+                          all_coef_df$predictor %in% num_predictors, ]
+  
+  for (i in 1:nrow(yr_coefs)) {
+    cat(yr_coefs$predictor[i], ":", yr_coefs$estimate[i], "\n")
+  }
+  cat("\n")
+}
+```
+
+we plot the numeric predictor coefficients across all five years on a single figure. Each predictor gets its own coloured line showing how its relationship with diversion probability changes from 2000 to 2004. This directly answers the question of whether the factors driving diversion shifted over time.
+
+```{r coefficient plot}
+plot_df <- all_coef_df[all_coef_df$predictor %in% num_predictors, ]
+
+ggplot(plot_df, aes(x = year, y = estimate, color = predictor)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Logistic Regression Coefficients Over Time (2000-2004)",
+       x     = "Year",
+       y     = "Coefficient Estimate",
+       color = "Predictor") +
+  theme_minimal()
+```
+
+Closing the connection 
+
+```{r close connection}
+dbDisconnect(conn)
+```
+
+
+
+
+
+
+
+
